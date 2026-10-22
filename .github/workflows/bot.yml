@@ -17,38 +17,40 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 9
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout Code
+        uses: actions/checkout@v4
         with:
-          # ГАРАНТИЯ: скачиваем именно ту ветку, в которой сейчас происходят изменения
-          ref: ${{ github.ref }}
+          ref: main  # Жестко заставляем скачивать файлы из ветки main
 
-      - uses: actions/setup-python@v5
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.12"
           cache: pip
 
-      - run: pip install -r requirements.txt
+      - name: Install Dependencies
+        run: pip install -r requirements.txt
 
-      # ДИАГНОСТИКА: эта строчка покажет нам реальный список файлов в консоли
-      - name: Проверить файлы в репозитории
-        run: ls -la
+      - name: Check Files
+        run: |
+          echo "=== СПИСОК ФАЙЛОВ В РЕПОЗИТОРИИ ==="
+          ls -la
+          echo "==================================="
 
-      - run: python bot.py
+      - name: Run Bot
+        run: python bot.py
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
 
       - name: Save state
-        # Будет запускаться только если Python-скрипт отработал успешно
-        if: success() 
+        if: success()
         run: |
           git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          
-          # УМНАЯ ПРОВЕРКА: сохраняем файл только если он физически существует и изменился
+          git config user.email "github-actions[bot]@://github.com"
           if [ -f state.json ]; then
             git add state.json
             git diff --cached --quiet || (git commit -m "update state" && git push)
           else
-            echo "Файл state.json еще не создан, так как новостей не найдено."
+            echo "Файл state.json отсутствует."
           fi
