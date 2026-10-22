@@ -1,4 +1,4 @@
-name: news-bot
+name: bot.py
 
 on:
   schedule:
