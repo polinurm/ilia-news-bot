@@ -1,4 +1,4 @@
-name: bot.py
+name: Run python bot.py
 
 on:
   schedule:
