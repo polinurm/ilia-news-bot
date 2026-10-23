@@ -19,7 +19,7 @@ UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0 Safari/537.36"
 
 # Перевод интервью через Gemini
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "")
-GEMINI_MODEL = "gemini-2.5-flash"      # при ошибке 404 бот сам подберёт модель
+GEMINI_MODEL = "gemini-flash-latest"
 TRANSLATE_TO = CHAT_ID                 # CHAT_ID = канал, ADMIN_CHAT_ID = только тебе
 TRANSLATE_MIN_SCORE = 3
 MAX_TRANSLATIONS_PER_RUN = 3
@@ -489,33 +489,29 @@ def external_links(html):
     return list(dict.fromkeys(out))
 
 
-def list_models():
-    r = requests.get("https://generativelanguage.googleapis.com/v1beta/models",
-                     headers={"x-goog-api-key": GEMINI_KEY},
-                     params={"pageSize": 100}, timeout=30)
-    r.raise_for_status()
-    return sorted(m["name"].split("/")[-1] for m in r.json().get("models", [])
-                  if "generateContent" in m.get("supportedGenerationMethods", []))
+MODEL_CANDIDATES = ["gemini-flash-latest", "gemini-flash-lite-latest", "gemini-3.5-flash",
+                    "gemini-3.1-flash-lite", "gemini-3.6-flash", "gemini-2.5-flash-lite",
+                    "gemma-4-31b-it"]
 
 
 def gemini(prompt):
     global GEMINI_MODEL
-    for attempt in range(2):
+    order = [GEMINI_MODEL] + [m for m in MODEL_CANDIDATES if m != GEMINI_MODEL]
+    last = None
+    for model in order:
         r = requests.post(
-            f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent",
+            f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
             headers={"x-goog-api-key": GEMINI_KEY, "Content-Type": "application/json"},
             json={"contents": [{"parts": [{"text": prompt}]}]}, timeout=120)
-        if r.status_code == 404 and attempt == 0:
-            names = list_models()
-            print("  доступные модели:", names)
-            flash = [n for n in names if "flash" in n and not re.search(r"image|tts|live|audio", n)]
-            if not flash:
-                r.raise_for_status()
-            GEMINI_MODEL = flash[0]
-            print("  выбрала модель:", GEMINI_MODEL)
+        if r.status_code in (404, 403, 429, 400):
+            print(f"  модель {model}: {r.status_code} {r.text[:150]}")
+            last = r
             continue
         r.raise_for_status()
+        GEMINI_MODEL = model
+        print("  работает модель:", model)
         return r.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+    last.raise_for_status()
 
 
 def process_translations():
