@@ -216,3 +216,36 @@ def decode_google_link(link):
         if s.endswith("\xd2\x01\x00"):
             s = s[:-3]
         n = bytearray(s, "latin1")[0]
+        s = s[2:n + 1] if n >= 0x80 else s[1:n + 1]
+        if s.startswith("http"):
+            return s
+    except Exception:
+        pass
+
+    sess = requests.Session()
+    sess.headers["User-Agent"] = UA
+    sess.cookies.update({"CONSENT": "YES+cb", "SOCS": "CAI"})
+    div = None
+    for base in ("https://news.google.com/articles/", "https://news.google.com/rss/articles/"):
+        r = sess.get(base + art, timeout=(10, 30))
+        soup = BeautifulSoup(r.text, "html.parser")
+        div = soup.select_one("c-wiz > div[jscontroller]")
+        if div and div.get("data-n-a-sg"):
+            break
+    if not (div and div.get("data-n-a-sg")):
+        title = soup.title.string[:60] if soup.title and soup.title.string else ""
+        print("  Google не отдал данные ссылки. Страница:", r.url, "|", title)
+        return None
+
+    inner = json.dumps(
+        ["garturlreq",
+         [["X", "X", ["X", "X"], None, None, 1, 1, "US:en", None, 1, None, None, None, None, None, 0, 1],
+          "X", "X", 1, [1, 1, 1], 1, 1, None, 0, 0, None, 0],
+         art, int(div["data-n-a-ts"]), div["data-n-a-sg"]],
+        separators=(",", ":"))
+    body = "f.req=" + quote(json.dumps([[["Fbv4je", inner]]]))
+    r = sess.post("https://news.google.com/_/DotsSplashUi/data/batchexecute", data=body,
+                  headers={"Content-Type": "application/x-www-form-urlencoded;charset=UTF-8"},
+                  timeout=(10, 30))
+    parsed = json.loads(r.text.split("\n\n")[1])[:-2]
+    return json.loads(parsed[0][2])[1]
