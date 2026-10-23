@@ -17,6 +17,13 @@ STRICT_TEXT = True
 STATE_FILE = "state.json"
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0 Safari/537.36"
 
+# Перевод интервью через Gemini
+GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "")
+GEMINI_MODEL = "gemini-2.5-flash"      # впиши название бесплатной модели из Playground
+TRANSLATE_TO = CHAT_ID                 # CHAT_ID = канал, ADMIN_CHAT_ID = только тебе
+TRANSLATE_MIN_SCORE = 3
+MAX_TRANSLATIONS_PER_RUN = 3
+
 BLOCKED = ["irbis.spb.ru", "prospect.com.ru"]
 OFFICIAL = ["usfigureskating.org", "isu.org", "olympics.com",
             "isu-skating.com", "goldenskate.com", "anythinggoe.com",
@@ -52,6 +59,7 @@ SITEMAPS = {
 
 stats = {"news": 0, "src": 0}
 errors = []
+pending_tr = []
 
 
 # ---------- сеть ----------
@@ -364,6 +372,7 @@ def entry_to_item(e):
         "summary": BeautifulSoup(e.get("summary", "") or "", "html.parser").get_text(" ", strip=True),
         "domain": urlparse(src.get("href") or link).netloc.lower(),
         "age": age_hours(e),
+        "html": e.get("summary", "") or ((e.get("content") or [{}])[0].get("value", "")),
     }
 
 
@@ -401,6 +410,7 @@ def handle_items(name, items, verify=False):
         seen[link] = None
         if send(f"🔔 {name} · {fmt_age(age)}\n{it['title']}\n{url}"):
             stats["news"] += 1
+            pending_tr.append({"name": name, "item": it, "url": url})
             print(f"Отправлено ({fmt_age(age)}): {it['title']}" + (f" | {why}" if why else ""))
     init.add(name)
 
@@ -468,7 +478,7 @@ def check_sites():
                     if urlparse(href).netloc == host and slug.count("-") >= 3 and href not in got:
                         got.add(href)
                         items.append({"link": href, "title": a.get_text(" ", strip=True) or slug,
-                                      "summary": "", "domain": host, "age": None})
+                                      "summary": "", "domain": host, "age": None, "html": ""})
                 print(f"  {name}: RSS не найден, ссылок на статьи со страницы: {len(items)}")
                 if not items:
                     raise ValueError("ни RSS, ни ссылок на статьи (возможно, страницу собирает JavaScript)")
@@ -528,7 +538,7 @@ def check_sitemaps():
                     age = lastmod_age(u.lastmod.text if u.lastmod else "")
                     if pattern in loc and age is not None and age <= MAX_AGE_HOURS:
                         items.append({"link": loc, "title": urlparse(loc).path.rstrip("/").split("/")[-1],
-                                      "summary": "", "domain": urlparse(loc).netloc, "age": age})
+                                      "summary": "", "domain": urlparse(loc).netloc, "age": age, "html": ""})
             print(f"  {name}: адресов в sitemap {total}, свежих подходящих {len(items)}")
             if total == 0:
                 raise ValueError("sitemap пустой или не открылся")
@@ -537,6 +547,120 @@ def check_sitemaps():
             errors.append(f"Сайт: {name}")
             print("Ошибка sitemap:", name, "|", str(err)[:200])
         time.sleep(1)
+
+
+# ---------- перевод интервью ----------
+INTERVIEW_RE = re.compile(r"interview|\bsaid\b|\bsays\b|talks|speaks|opens up|q&a|"
+                          r"インタビュー|語る|明かす|一問一答|интервью", re.IGNORECASE)
+OVERVIEW_RE = re.compile(r"schedule|how to watch|results|preview|ranking|start list|"
+                         r"расписание|результаты|превью", re.IGNORECASE)
+PAYWALL_RE = re.compile(r"有料記事|有料会員|会員限定|この記事は有料|subscribers only|"
+                        r"to continue reading|paywall", re.IGNORECASE)
+
+
+def interview_score(title, text):
+    s = 0
+    if INTERVIEW_RE.search(title):
+        s += 2
+    if OVERVIEW_RE.search(title):
+        s -= 2
+    quotes = len(re.findall(r'["“][^"”]{25,}["”]', text)) + len(re.findall(r'「[^」]{8,}」', text))
+    if quotes >= 3:
+        s += 2
+    if re.search(r"(Malinin|Ilia|マリニン)[^.。\n]{0,40}(said|says|told|語った|明かした|話した)", text):
+        s += 1
+    if re.search(r"translation|translated|перевод|翻訳", title, re.IGNORECASE):
+        s += 1
+    return s
+
+
+def external_links(html):
+    out = []
+    for a in BeautifulSoup(html or "", "html.parser").find_all("a", href=True):
+        h = a["href"]
+        if h.startswith("http") and not re.search(r"reddit\.com|redd\.it|redditmedia", h):
+            out.append(h)
+    return list(dict.fromkeys(out))
+
+
+def gemini(prompt):
+    r = requests.post(
+        f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent",
+        headers={"x-goog-api-key": GEMINI_KEY, "Content-Type": "application/json"},
+        json={"contents": [{"parts": [{"text": prompt}]}]}, timeout=120)
+    r.raise_for_status()
+    return r.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+
+
+def process_translations():
+    if not GEMINI_KEY:
+        return
+    done = yt_cache.setdefault("tr", [])
+    n = 0
+    for p in pending_tr:
+        if n >= MAX_TRANSLATIONS_PER_RUN:
+            break
+        it = p["item"]
+        try:
+            is_reddit = p["name"].startswith("Reddit")
+            src, reddit_text = p["url"], ""
+            if is_reddit:
+                links = external_links(it.get("html", ""))
+                src = links[0] if links else None
+                reddit_text = BeautifulSoup(it.get("html", ""), "html.parser").get_text("\n", strip=True)
+                reddit_text = re.sub(r"submitted by.*|\[link\]|\[comments\]", "", reddit_text).strip()
+            key = (src or p["url"]).split("?")[0].rstrip("/")
+            if key in done or p["url"] in done:
+                continue
+
+            text, paywall = "", False
+            if src and "news.google.com" not in src:
+                try:
+                    html = fetch(src).decode("utf-8", errors="ignore")
+                    text = extract_main(html)
+                    paywall = len(text) < 800 or bool(PAYWALL_RE.search(html))
+                except Exception as err:
+                    print("  перевод: оригинал не открылся:", src, "|", str(err)[:80])
+                    paywall = True
+            used_reddit = False
+            if (not text or paywall) and len(reddit_text) >= 500:
+                text, used_reddit = reddit_text, True
+            if not text:
+                continue
+            if interview_score(it["title"], text) < TRANSLATE_MIN_SCORE:
+                continue
+
+            prompt = ("Ты переводчик интервью о фигурном катании. Ниже текст на английском или японском.\n"
+                      "Если это НЕ интервью и не материал с прямой речью спортсмена (обзор, расписание, "
+                      "результаты, новость без цитат), ответь одним словом: SKIP.\n"
+                      "Иначе переведи на русский точно, без пересказа и без добавлений от себя. "
+                      "Прямую речь сохрани в кавычках, имена пиши по-русски "
+                      "(Ilia Malinin, イリア・マリニン = Илья Малинин). Если текст обрезан, переведи "
+                      "только то, что есть, ничего не додумывай. В ответе только перевод.\n\n"
+                      f"Заголовок: {it['title']}\n\n{text[:14000]}")
+            ru = gemini(prompt)
+            if ru.strip().upper().startswith("SKIP"):
+                print("  перевод: Gemini счёл не интервью:", it["title"])
+                continue
+
+            head = f"🈯 Перевод статьи\n{it['title']}\nОригинал: {src or p['url']}"
+            if used_reddit:
+                head += f"\nТекст взят из поста на Reddit: {p['url']}"
+                if paywall:
+                    head += "\n(на сайте платный доступ)"
+            elif paywall:
+                head += "\n⚠️ Источник платный, переведён только доступный фрагмент"
+            full = head + "\n\n" + ru + "\n\nМашинный перевод, возможны неточности."
+            ok = True
+            for i in range(0, len(full), 3800):
+                ok = send(full[i:i + 3800], to=TRANSLATE_TO) and ok
+            if ok:
+                done.append(key)
+                del done[:-500]
+                n += 1
+                print("Отправлен перевод:", it["title"])
+        except Exception as err:
+            print("Ошибка перевода:", str(err)[:200])
 
 
 # ---------- сводка и запуск ----------
@@ -568,6 +692,11 @@ def main():
         check_sitemaps()
     except Exception as err:
         print("Сбой цикла:", err)
+
+    try:
+        process_translations()
+    except Exception as err:
+        print("Сбой переводов:", err)
 
     day["runs"] += 1
     for n in errors:
