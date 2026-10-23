@@ -593,6 +593,7 @@ def gemini(prompt):
 
 
 def process_translations():
+    print(f"  перевод: ключ {'есть' if GEMINI_KEY else 'НЕ ЗАДАН'}, кандидатов {len(pending_tr)}")
     if not GEMINI_KEY:
         return
     done = yt_cache.setdefault("tr", [])
@@ -611,6 +612,7 @@ def process_translations():
                 reddit_text = re.sub(r"submitted by.*|\[link\]|\[comments\]", "", reddit_text).strip()
             key = (src or p["url"]).split("?")[0].rstrip("/")
             if key in done or p["url"] in done:
+                print("  перевод: уже переводили:", it["title"])
                 continue
 
             text, paywall = "", False
@@ -626,8 +628,11 @@ def process_translations():
             if (not text or paywall) and len(reddit_text) >= 500:
                 text, used_reddit = reddit_text, True
             if not text:
+                print(f"  перевод: нет текста (источник: {src}, текст поста: {len(reddit_text)} зн.): {it['title']}")
                 continue
-            if interview_score(it["title"], text) < TRANSLATE_MIN_SCORE:
+            score = interview_score(it["title"], text)
+            if score < TRANSLATE_MIN_SCORE:
+                print(f"  перевод: {score} балла из {TRANSLATE_MIN_SCORE}, пропуск: {it['title']}")
                 continue
 
             prompt = ("Ты переводчик интервью о фигурном катании. Ниже текст на английском или японском.\n"
@@ -660,7 +665,7 @@ def process_translations():
                 n += 1
                 print("Отправлен перевод:", it["title"])
         except Exception as err:
-            print("Ошибка перевода:", str(err)[:200])
+            print("Ошибка перевода:", str(err)[:300])
 
 
 # ---------- сводка и запуск ----------
