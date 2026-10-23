@@ -1,5 +1,5 @@
-import feedparser, requests, json, os, re, time, calendar, base64, gzip
-from datetime import datetime, timezone
+import feedparser, requests, json, os, re, time, calendar, base64
+from datetime import datetime
 from zoneinfo import ZoneInfo
 from urllib.parse import quote, urljoin, urlparse
 from bs4 import BeautifulSoup
@@ -19,7 +19,7 @@ UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0 Safari/537.36"
 
 # Перевод интервью через Gemini
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "")
-GEMINI_MODEL = "gemini-2.5-flash"      # впиши название бесплатной модели из Playground
+GEMINI_MODEL = "gemini-2.5-flash"      # при ошибке 404 бот сам подберёт модель
 TRANSLATE_TO = CHAT_ID                 # CHAT_ID = канал, ADMIN_CHAT_ID = только тебе
 TRANSLATE_MIN_SCORE = 3
 MAX_TRANSLATIONS_PER_RUN = 3
@@ -35,25 +35,17 @@ GOOGLE_SITES = {
     "US Figure Skating": 'site:usfigureskating.org Malinin',
     "ISU": 'site:isu.org Malinin',
     "Olympics": 'site:olympics.com Malinin',
+    "GoldenSkate": 'site:goldenskate.com Malinin',
     "Mainichi": 'site:mainichi.jp マリニン',
     "Kyodo": 'site:kyodonews.jp マリニン',
 }
-YOUTUBE = ["https://www.youtube.com/@IliaQuadgodMalinin"]
-YOUTUBE_IDS = {}
 REDDIT = ["r/IliaQuadg0dMalinin"]
 
 # Сайты: бот ищет RSS, а если его нет, читает ссылки на статьи со страницы
 SITES = {
-    "ISU News": "https://isu-skating.com/en/news/",
-    "GoldenSkate": "https://www.goldenskate.com/category/news/",
     "AnythingGOE": "https://anythinggoe.com/",
     "USFS": "https://usfigureskating.org/news",
     "Kyodo DeepEdge": "https://deepedgeplus.kyodonews.jp/",
-}
-# Sitemap: название: (адрес sitemap, фрагмент в адресах статей). Адреса угаданы.
-SITEMAPS = {
-    "ISU (sitemap)": ("https://www.isu.org/sitemap.xml", "/news"),
-    "Olympics (sitemap)": ("https://www.olympics.com/sitemap.xml", "/news/"),
 }
 # ====================================
 
@@ -315,24 +307,6 @@ def is_blocked(item):
 
 
 # ---------- источники ----------
-def youtube_feed(url):
-    if url not in yt_cache:
-        if url in YOUTUBE_IDS:
-            yt_cache[url] = YOUTUBE_IDS[url]
-        else:
-            r = requests.get(url, headers={"User-Agent": UA, "Accept-Language": "en-US,en;q=0.9"},
-                             cookies={"CONSENT": "YES+1", "SOCS": "CAI"}, timeout=(10, 30))
-            html = r.text
-            m = (re.search(r'channel_id=(UC[\w-]{22})', html)
-                 or re.search(r'"externalId":"(UC[\w-]{22})"', html)
-                 or re.search(r'"channelId":"(UC[\w-]{22})"', html)
-                 or re.search(r'channel/(UC[\w-]{22})', html))
-            if not m:
-                raise ValueError("не нашла channel_id, впиши его вручную в YOUTUBE_IDS")
-            yt_cache[url] = m.group(1)
-    return f"https://www.youtube.com/feeds/videos.xml?channel_id={yt_cache[url]}"
-
-
 def google_rss(query, lang="ru"):
     q = quote(f"{query} when:{MAX_AGE_HOURS}h")
     if lang == "ru":
@@ -417,14 +391,6 @@ def handle_items(name, items, verify=False):
 
 def check_feeds():
     feeds = build_feeds()
-    for url in YOUTUBE:
-        name = f"YouTube: {url.rstrip('/').split('/')[-1]}"
-        try:
-            feeds[name] = youtube_feed(url)
-        except Exception as err:
-            stats["src"] += 1
-            errors.append(name)
-            print("Ошибка YouTube:", err)
     for name, url in feeds.items():
         stats["src"] += 1
         try:
@@ -489,66 +455,6 @@ def check_sites():
         time.sleep(1)
 
 
-# ---------- sitemap ----------
-def lastmod_age(s):
-    if not s:
-        return None
-    try:
-        dt = datetime.fromisoformat(s.strip().replace("Z", "+00:00"))
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return (time.time() - dt.timestamp()) / 3600
-    except Exception:
-        return None
-
-
-def read_xml(url):
-    data = fetch(url, timeout=40)
-    if url.endswith(".gz"):
-        data = gzip.decompress(data)
-    return BeautifulSoup(data, "xml")
-
-
-def check_sitemaps():
-    for name, (url, pattern) in SITEMAPS.items():
-        stats["src"] += 1
-        try:
-            soup = read_xml(url)
-            pages = [soup]
-            if soup.find("sitemapindex"):
-                kids = []
-                for s in soup.find_all("sitemap"):
-                    if s.loc:
-                        lm = s.lastmod.text if s.lastmod else ""
-                        kids.append((("news" in s.loc.text.lower()), lm, s.loc.text.strip()))
-                kids.sort(reverse=True)
-                pages = []
-                for _, _, u in kids[:3]:
-                    try:
-                        pages.append(read_xml(u))
-                    except Exception as err:
-                        print("  не открылся дочерний sitemap:", u, "|", str(err)[:80])
-            items, total = [], 0
-            for pg in pages:
-                for u in pg.find_all("url"):
-                    if not u.loc:
-                        continue
-                    total += 1
-                    loc = u.loc.text.strip()
-                    age = lastmod_age(u.lastmod.text if u.lastmod else "")
-                    if pattern in loc and age is not None and age <= MAX_AGE_HOURS:
-                        items.append({"link": loc, "title": urlparse(loc).path.rstrip("/").split("/")[-1],
-                                      "summary": "", "domain": urlparse(loc).netloc, "age": age, "html": ""})
-            print(f"  {name}: адресов в sitemap {total}, свежих подходящих {len(items)}")
-            if total == 0:
-                raise ValueError("sitemap пустой или не открылся")
-            handle_items(f"Сайт: {name}", items, verify=True)
-        except Exception as err:
-            errors.append(f"Сайт: {name}")
-            print("Ошибка sitemap:", name, "|", str(err)[:200])
-        time.sleep(1)
-
-
 # ---------- перевод интервью ----------
 INTERVIEW_RE = re.compile(r"interview|\bsaid\b|\bsays\b|talks|speaks|opens up|q&a|"
                           r"インタビュー|語る|明かす|一問一答|интервью", re.IGNORECASE)
@@ -583,13 +489,33 @@ def external_links(html):
     return list(dict.fromkeys(out))
 
 
-def gemini(prompt):
-    r = requests.post(
-        f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent",
-        headers={"x-goog-api-key": GEMINI_KEY, "Content-Type": "application/json"},
-        json={"contents": [{"parts": [{"text": prompt}]}]}, timeout=120)
+def list_models():
+    r = requests.get("https://generativelanguage.googleapis.com/v1beta/models",
+                     headers={"x-goog-api-key": GEMINI_KEY},
+                     params={"pageSize": 100}, timeout=30)
     r.raise_for_status()
-    return r.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+    return sorted(m["name"].split("/")[-1] for m in r.json().get("models", [])
+                  if "generateContent" in m.get("supportedGenerationMethods", []))
+
+
+def gemini(prompt):
+    global GEMINI_MODEL
+    for attempt in range(2):
+        r = requests.post(
+            f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent",
+            headers={"x-goog-api-key": GEMINI_KEY, "Content-Type": "application/json"},
+            json={"contents": [{"parts": [{"text": prompt}]}]}, timeout=120)
+        if r.status_code == 404 and attempt == 0:
+            names = list_models()
+            print("  доступные модели:", names)
+            flash = [n for n in names if "flash" in n and not re.search(r"image|tts|live|audio", n)]
+            if not flash:
+                r.raise_for_status()
+            GEMINI_MODEL = flash[0]
+            print("  выбрала модель:", GEMINI_MODEL)
+            continue
+        r.raise_for_status()
+        return r.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
 
 
 def process_translations():
@@ -694,7 +620,6 @@ def main():
     try:
         check_feeds()
         check_sites()
-        check_sitemaps()
     except Exception as err:
         print("Сбой цикла:", err)
 
