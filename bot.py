@@ -98,6 +98,7 @@ def load_state():
     return (dict.fromkeys(d.get("seen", [])), set(d.get("init", [])), d.get("yt", {}),
             d.get("tries", {}), d.get("sf", {}), d.get("day", {}), d.get("digest_date", ""))
 
+
 seen, init, yt_cache, tries, site_feed, day, digest_date = load_state()
 day.setdefault("runs", 0)
 day.setdefault("errs", {})
@@ -249,3 +250,339 @@ def decode_google_link(link):
                   timeout=(10, 30))
     parsed = json.loads(r.text.split("\n\n")[1])[:-2]
     return json.loads(parsed[0][2])[1]
+
+
+def real_url(link):
+    if "news.google.com" not in link:
+        return link
+    try:
+        u = decode_google_link(link)
+        if u:
+            return u
+    except Exception as err:
+        print("  своя расшифровка не сработала:", err)
+    try:
+        res = gnewsdecoder(link, interval=1)
+        if res.get("status"):
+            return res["decoded_url"]
+    except Exception:
+        pass
+    return link
+
+
+def check_relevance(item):
+    url = real_url(item["link"])
+    if any(b in url.lower() for b in BLOCKED):
+        return False, url, "сайт в чёрном списке", True
+    official = any(d in f"{item['domain']} {url}".lower() for d in OFFICIAL)
+    text, html = "", ""
+    if "news.google.com" in url:
+        print("  нет прямой ссылки, текст не прочитан")
+    else:
+        try:
+            html = fetch(url).decode("utf-8", errors="ignore")
+            text = extract_main(html)
+            meta = meta_text(html)
+            if len(text) < 400 and meta:
+                text = meta + "\n" + text
+            if not text:
+                print("  страница скачалась, но текст не извлёкся:", url)
+        except Exception as err:
+            print("  не скачала статью:", url, "|", err)
+    if text:
+        ok, why = judge(item["title"], text, official)
+        extra = ""
+        if ok:
+            extra = " | " + snippet(body_text(text) or text)
+        elif SURNAME_RE.search(html):
+            extra = " | фамилия есть только вне основного текста (боковые блоки)"
+        return ok, url, f"{why}, текст {len(text)} зн.{extra}", True
+    ok, why = judge(item["title"], item["summary"], official)
+    return ok, url, f"{why} (текст не прочитан)", False
+
+
+def is_blocked(item):
+    blob = f"{item['domain']} {item['title']} {item['link']}".lower()
+    return any(b in blob for b in BLOCKED)
+
+
+# ---------- источники ----------
+def youtube_feed(url):
+    if url not in yt_cache:
+        if url in YOUTUBE_IDS:
+            yt_cache[url] = YOUTUBE_IDS[url]
+        else:
+            r = requests.get(url, headers={"User-Agent": UA, "Accept-Language": "en-US,en;q=0.9"},
+                             cookies={"CONSENT": "YES+1", "SOCS": "CAI"}, timeout=(10, 30))
+            html = r.text
+            m = (re.search(r'channel_id=(UC[\w-]{22})', html)
+                 or re.search(r'"externalId":"(UC[\w-]{22})"', html)
+                 or re.search(r'"channelId":"(UC[\w-]{22})"', html)
+                 or re.search(r'channel/(UC[\w-]{22})', html))
+            if not m:
+                raise ValueError("не нашла channel_id, впиши его вручную в YOUTUBE_IDS")
+            yt_cache[url] = m.group(1)
+    return f"https://www.youtube.com/feeds/videos.xml?channel_id={yt_cache[url]}"
+
+
+def google_rss(query, lang="ru"):
+    q = quote(f"{query} when:{MAX_AGE_HOURS}h")
+    if lang == "ru":
+        return f"https://news.google.com/rss/search?q={q}&hl=ru&gl=RU&ceid=RU:ru"
+    if lang == "ja":
+        return f"https://news.google.com/rss/search?q={q}&hl=ja&gl=JP&ceid=JP:ja"
+    return f"https://news.google.com/rss/search?q={q}&hl=en&gl=US&ceid=US:en"
+
+
+def query_lang(q):
+    if re.search("[ぁ-んァ-ン一-龥]", q):
+        return "ja"
+    if re.search("[а-яА-Я]", q):
+        return "ru"
+    return "en"
+
+
+def build_feeds():
+    feeds = {}
+    for q in GOOGLE_QUERIES:
+        feeds[f"Google News: {q.strip(chr(34))}"] = google_rss(q, query_lang(q))
+    for name, query in GOOGLE_SITES.items():
+        feeds[f"{name} (сайт)"] = google_rss(query, query_lang(query))
+    for r in REDDIT:
+        kind, name = r.split("/", 1)
+        path = f"r/{name}/new" if kind == "r" else f"user/{name}"
+        feeds[f"Reddit: {r}"] = f"https://www.reddit.com/{path}/.rss"
+    return feeds
+
+
+def entry_to_item(e):
+    src = e.get("source") or {}
+    link = e.get("link", "")
+    return {
+        "link": link,
+        "title": e.get("title", ""),
+        "summary": BeautifulSoup(e.get("summary", "") or "", "html.parser").get_text(" ", strip=True),
+        "domain": urlparse(src.get("href") or link).netloc.lower(),
+        "age": age_hours(e),
+    }
+
+
+# ---------- обработка ----------
+def handle_items(name, items, verify=False):
+    first = (SILENT_FIRST_RUN or name.startswith("Сайт:")) and name not in init
+    for it in items:
+        link = it["link"]
+        if not link or link in seen:
+            continue
+        age = it["age"]
+        if first or (age is not None and age > MAX_AGE_HOURS):
+            seen[link] = None
+            continue
+        if is_blocked(it):
+            seen[link] = None
+            print("Чёрный список:", it["title"])
+            continue
+        url, why = link, ""
+        if verify:
+            ok, url, why, checked = check_relevance(it)
+            if not ok:
+                if not checked:
+                    tries[link] = tries.get(link, 0) + 1
+                    if tries[link] < 3:
+                        print(f"Не удалось прочитать, повторю позже ({tries[link]}/3): {it['title']}")
+                        continue
+                tries.pop(link, None)
+                seen[link] = None
+                day["rej"].append({"s": name, "t": it["title"], "w": why, "u": url})
+                del day["rej"][:-200]
+                print(f"Не по теме [{name}] ({fmt_age(age)}): {it['title']} | {why}")
+                continue
+        tries.pop(link, None)
+        seen[link] = None
+        if send(f"🔔 {name} · {fmt_age(age)}\n{it['title']}\n{url}"):
+            stats["news"] += 1
+            print(f"Отправлено ({fmt_age(age)}): {it['title']}" + (f" | {why}" if why else ""))
+    init.add(name)
+
+
+def check_feeds():
+    feeds = build_feeds()
+    for url in YOUTUBE:
+        name = f"YouTube: {url.rstrip('/').split('/')[-1]}"
+        try:
+            feeds[name] = youtube_feed(url)
+        except Exception as err:
+            stats["src"] += 1
+            errors.append(name)
+            print("Ошибка YouTube:", err)
+    for name, url in feeds.items():
+        stats["src"] += 1
+        try:
+            entries = feedparser.parse(fetch(url)).entries
+            verify = name.startswith("Google News") or name.endswith("(сайт)")
+            handle_items(name, [entry_to_item(e) for e in entries], verify)
+        except Exception as err:
+            errors.append(name)
+            print("Ошибка ленты:", name, "|", err)
+        time.sleep(1)
+
+
+def find_feed_urls(page_url, html):
+    soup = BeautifulSoup(html, "html.parser")
+    urls = []
+    for l in soup.find_all("link", href=True):
+        t = (l.get("type") or "").lower()
+        if "alternate" in (l.get("rel") or []) and ("rss" in t or "atom" in t):
+            urls.append(urljoin(page_url, l["href"]))
+    p = urlparse(page_url)
+    base = f"{p.scheme}://{p.netloc}"
+    urls += [page_url.rstrip("/") + "/feed/", base + "/feed/", base + "/rss", base + "/feed"]
+    return list(dict.fromkeys(urls))
+
+
+def check_sites():
+    for name, url in SITES.items():
+        stats["src"] += 1
+        try:
+            html = fetch(url).decode("utf-8", errors="ignore")
+            candidates = [site_feed[name]] if name in site_feed else find_feed_urls(url, html)
+            feed_items = None
+            for fu in candidates:
+                try:
+                    entries = feedparser.parse(fetch(fu)).entries
+                except Exception:
+                    continue
+                if entries:
+                    site_feed[name] = fu
+                    feed_items = [entry_to_item(e) for e in entries]
+                    break
+            if feed_items:
+                print(f"  {name}: RSS {site_feed[name]}, записей {len(feed_items)}")
+                handle_items(f"{name} (сайт)", feed_items, verify=True)
+            else:
+                host = urlparse(url).netloc
+                items, got = [], set()
+                for a in BeautifulSoup(html, "html.parser").find_all("a", href=True):
+                    href = urljoin(url, a["href"]).split("#")[0].split("?")[0]
+                    slug = urlparse(href).path.rstrip("/").split("/")[-1]
+                    if urlparse(href).netloc == host and slug.count("-") >= 3 and href not in got:
+                        got.add(href)
+                        items.append({"link": href, "title": a.get_text(" ", strip=True) or slug,
+                                      "summary": "", "domain": host, "age": None})
+                print(f"  {name}: RSS не найден, ссылок на статьи со страницы: {len(items)}")
+                if not items:
+                    raise ValueError("ни RSS, ни ссылок на статьи (возможно, страницу собирает JavaScript)")
+                handle_items(f"Сайт: {name}", items, verify=True)
+        except Exception as err:
+            errors.append(f"Сайт: {name}")
+            print("Ошибка сайта:", name, "|", err)
+        time.sleep(1)
+
+
+# ---------- sitemap ----------
+def lastmod_age(s):
+    if not s:
+        return None
+    try:
+        dt = datetime.fromisoformat(s.strip().replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return (time.time() - dt.timestamp()) / 3600
+    except Exception:
+        return None
+
+
+def read_xml(url):
+    data = fetch(url, timeout=40)
+    if url.endswith(".gz"):
+        data = gzip.decompress(data)
+    return BeautifulSoup(data, "xml")
+
+
+def check_sitemaps():
+    for name, (url, pattern) in SITEMAPS.items():
+        stats["src"] += 1
+        try:
+            soup = read_xml(url)
+            pages = [soup]
+            if soup.find("sitemapindex"):
+                kids = []
+                for s in soup.find_all("sitemap"):
+                    if s.loc:
+                        lm = s.lastmod.text if s.lastmod else ""
+                        kids.append((("news" in s.loc.text.lower()), lm, s.loc.text.strip()))
+                kids.sort(reverse=True)
+                pages = []
+                for _, _, u in kids[:3]:
+                    try:
+                        pages.append(read_xml(u))
+                    except Exception as err:
+                        print("  не открылся дочерний sitemap:", u, "|", str(err)[:80])
+            items, total = [], 0
+            for pg in pages:
+                for u in pg.find_all("url"):
+                    if not u.loc:
+                        continue
+                    total += 1
+                    loc = u.loc.text.strip()
+                    age = lastmod_age(u.lastmod.text if u.lastmod else "")
+                    if pattern in loc and age is not None and age <= MAX_AGE_HOURS:
+                        items.append({"link": loc, "title": urlparse(loc).path.rstrip("/").split("/")[-1],
+                                      "summary": "", "domain": urlparse(loc).netloc, "age": age})
+            print(f"  {name}: адресов в sitemap {total}, свежих подходящих {len(items)}")
+            if total == 0:
+                raise ValueError("sitemap пустой или не открылся")
+            handle_items(f"Сайт: {name}", items, verify=True)
+        except Exception as err:
+            errors.append(f"Сайт: {name}")
+            print("Ошибка sitemap:", name, "|", str(err)[:200])
+        time.sleep(1)
+
+
+# ---------- сводка и запуск ----------
+def send_digest():
+    runs = day["runs"]
+    lines = [f"📋 Сводка за сутки (запусков: {runs})"]
+    if day["errs"]:
+        lines.append("\nИсточники с ошибками:")
+        for n, c in sorted(day["errs"].items()):
+            lines.append(f"• {n}: {c} из {runs} запусков")
+    else:
+        lines.append("\nВсе источники отвечали.")
+    rej = day["rej"]
+    lines.append(f"\nОтклонено как не по теме: {len(rej)}")
+    for r in rej[-60:]:
+        lines.append(f"• [{r['s']}] {r['t'][:100]}\n  {r['w']}\n  {r['u']}")
+    text = "\n".join(lines)
+    ok = True
+    for i in range(0, len(text), 3800):
+        ok = send(text[i:i + 3800], silent=True, to=ADMIN_CHAT_ID) and ok
+    return ok
+
+
+def main():
+    global digest_date
+    try:
+        check_feeds()
+        check_sites()
+        check_sitemaps()
+    except Exception as err:
+        print("Сбой цикла:", err)
+
+    day["runs"] += 1
+    for n in errors:
+        day["errs"][n] = day["errs"].get(n, 0) + 1
+    print(f"[{datetime.now():%H:%M:%S}] Ошибок источников: {len(errors)}, новых уведомлений {stats['news']}")
+
+    now = datetime.now(ZoneInfo("Europe/Moscow"))
+    today = now.strftime("%Y-%m-%d")
+    if now.hour >= DIGEST_HOUR and digest_date != today:
+        if send_digest():
+            digest_date = today
+            day["runs"], day["errs"], day["rej"] = 0, {}, []
+
+
+try:
+    main()
+finally:
+    save_state()
